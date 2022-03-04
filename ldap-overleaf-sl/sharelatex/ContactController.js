@@ -51,7 +51,7 @@ module.exports = ContactsController = {
             const contact_id = contact_ids[i]
             positions[contact_id] = i
           }
-	  
+
           contacts.sort(
             (a, b) =>
               positions[a._id != null ? a._id.toString() : undefined] -
@@ -60,7 +60,7 @@ module.exports = ContactsController = {
 
           // Don't count holding accounts to discourage users from repeating mistakes (mistyped or wrong emails, etc)
           contacts = contacts.filter(c => !c.holdingAccount)
-	  ContactsController.getLdapContacts(contacts).then((ldapcontacts) => { 
+	  ContactsController.getLdapContacts(contacts).then((ldapcontacts) => {
 	    contacts.push(ldapcontacts)
             contacts = contacts.map(ContactsController._formatContact)
             return Modules.hooks.fire('getContacts', user_id, contacts, function(
@@ -75,7 +75,7 @@ module.exports = ContactsController = {
                 contacts
               })
             })
-  	  }).catch(e => console.log("Error appending ldap contacts" + e))
+  	  }).catch(e => logger.error({},"Error appending ldap contacts" + e))
 
         }
       )
@@ -94,7 +94,7 @@ module.exports = ContactsController = {
       try {
         await client.bind(process.env.LDAP_BIND_USER, process.env.LDAP_BIND_PW);
       } catch (ex) {
-        console.log("Could not bind LDAP reader user: " + String(ex) )
+        logger.error({},"Could not bind LDAP reader user: " + String(ex) )
       }
     }
 
@@ -103,6 +103,7 @@ module.exports = ContactsController = {
     try {
       // if you need an client.bind do it here.
       const {searchEntries,searchReferences,} = await client.search(ldap_base, {scope: 'sub',filter: process.env.LDAP_CONTACT_FILTER ,});
+      logger.error({},  process.env.LDAP_CONTACT_FILTER)
       await searchEntries;
       for (var i = 0; i < searchEntries.length; i++) {
        var entry = new Map()
@@ -118,11 +119,11 @@ module.exports = ContactsController = {
        }
       }
     } catch (ex) {
-      console.log(String(ex))
-    }  
-    //console.log(JSON.stringify(contacts)) 
+      logger.error({},String(ex))
+    }
+    //logger.error({},JSON.stringify(contacts))
     finally {
-     // even if we did not use bind - the constructor of 
+     // even if we did not use bind - the constructor of
      // new Client() opens a socket to the ldap server
      client.unbind()
      return contacts

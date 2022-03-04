@@ -2,23 +2,25 @@ const Settings = require('@overleaf/settings')
 const { User } = require('../../models/User')
 const { db, ObjectId } = require('../../infrastructure/mongodb')
 const bcrypt = require('bcrypt')
+const logger = require('@overleaf/logger')
 const EmailHelper = require('../Helpers/EmailHelper')
 const {
   InvalidEmailError,
   InvalidPasswordError,
+  ParallelLoginError,
 } = require('./AuthenticationErrors')
 const util = require('util')
 
+// Custom imports for LDAP
 const { Client } = require('ldapts');
 const ldapEscape = require('ldap-escape');
 
-// https://www.npmjs.com/package/@overleaf/o-error
-// have a look if we can do nice error messages.
+const HaveIBeenPwned = require('./HaveIBeenPwned')
 
 const BCRYPT_ROUNDS = Settings.security.bcryptRounds || 12
 const BCRYPT_MINOR_VERSION = Settings.security.bcryptMinorVersion || 'a'
 
-const _checkWriteResult = function(result, callback) {
+const _checkWriteResult = function (result, callback) {
   // for MongoDB
   if (result && result.modifiedCount === 1) {
     callback(null, true)
@@ -29,94 +31,78 @@ const _checkWriteResult = function(result, callback) {
 
 const AuthenticationManager = {
   authenticate(query, password, callback) {
+    logger.error(query, password, callback)
     // Using Mongoose for legacy reasons here. The returned User instance
     // gets serialized into the session and there may be subtle differences
     // between the user returned by Mongoose vs mongodb (such as default values)
     User.findOne(query, (error, user) => {
-      //console.log("Begining:" + JSON.stringify(query))
       AuthenticationManager.authUserObj(error, user, query, password, callback)
     })
   },
-    //login with any password
+
+  //login with any password
   login(user, password, callback) {
     AuthenticationManager.checkRounds(
-      user,
-      user.hashedPassword,
-      password,
-      function (err) {
-        if (err) {
-          return callback(err)
-        }
-        callback(null, user)
+        user,
+        user.hashedPassword,
+        password,
+        function (err) {
+          if (err) {
+            return callback(err)
+          }
+          callback(null, user)
         }
     )
   },
 
+  authUserObj(error, user, query, password, callback) {
+    AuthenticationManager.ldapAuth(query, password, AuthenticationManager.createIfNotExistAndLogin, callback, user)
+    return null
+  },
+
   createIfNotExistAndLogin(query, user, callback, uid, firstname, lastname, mail, isAdmin) {
     if (!user) {
-      //console.log("Creating User:" + JSON.stringify(query))
+      logger.error({}, "Creating User:" + JSON.stringify(query))
       //create random pass for local userdb, does not get checked for ldap users during login
       let pass = require("crypto").randomBytes(32).toString("hex")
-      //console.log("Creating User:" + JSON.stringify(query) + "Random Pass" + pass)
-
+      logger.error({}, "Creating User:" + JSON.stringify(query) + "Random Pass" + pass)
+      logger.error({}, "Is admin "  + isAdmin.toString())
       const userRegHand = require('../User/UserRegistrationHandler.js')
       userRegHand.registerNewUser({
-        email: mail,
-        first_name: firstname,
-        last_name: lastname,
-        password: pass
-      },
-      function (error, user) {
-        if (error) {
-          console.log(error)
-        }
-        user.email = mail
-        user.isAdmin = isAdmin
-        user.emails[0].confirmedAt = Date.now()
-        user.save()
-        //console.log("user %s added to local library: ", mail)
-        User.findOne(query, (error, user) => {
-          if (error) {
-            console.log(error)
-          }
-          if (user && user.hashedPassword) {
-            AuthenticationManager.login(user, "randomPass", callback)
-          }
-        })
-      }) // end register user
+            email: mail,
+            first_name: firstname,
+            last_name: lastname,
+            password: pass
+          },
+          async function (error, user) {
+            if (error) {
+              logger.error(error)
+            }
+            user.email = mail
+            user.isAdmin = isAdmin
+            logger.error({}, "Setting admin to"  + isAdmin.toString())
+            user.emails[0].confirmedAt = Date.now()
+            await user.save()
+            logger.error({}, "user %s added to local library: ", mail)
+            User.findOne(query, (error, user) => {
+              if (error) {
+                console.error({}, error)
+              }
+              if (user && user.hashedPassword) {
+                AuthenticationManager.login(user, "randomPass", callback)
+              }
+            })
+          }) // end register user
     } else {
       AuthenticationManager.login(user, "randomPass", callback)
     }
   },
 
-  authUserObj(error, user, query, password, callback) {
-    if ( process.env.ALLOW_EMAIL_LOGIN && user && user.hashedPassword) {
-        console.log("email login for existing user " + query.email)
-        // check passwd against local db
-        bcrypt.compare(password, user.hashedPassword, function (error, match) {
-          if (match) {
-            console.log("Local user password match")
-            AuthenticationManager.login(user, password, callback)
-          } else {
-            console.log("Local user password mismatch, trying LDAP")
-            // check passwd against ldap
-            AuthenticationManager.ldapAuth(query, password, AuthenticationManager.createIfNotExistAndLogin, callback, user)
-          }
-        })
-    } else {
-      // No local passwd check user has to be in ldap and use ldap credentials
-      AuthenticationManager.ldapAuth(query, password, AuthenticationManager.createIfNotExistAndLogin, callback, user)
-    }
-    return null
-  },
-
   validateEmail(email) {
-    // we use the emailadress from the ldap
-    // therefore we do not enforce checks here
     const parsed = EmailHelper.parseEmail(email)
-    //if (!parsed) {
-    //    return new InvalidEmailError({ message: 'email not valid' })
-    //}
+    // if (!parsed) {
+    //   return new InvalidEmailError({ message: 'email not valid' })
+    // }
     return null
   },
 
@@ -161,16 +147,28 @@ const AuthenticationManager = {
       })
     }
     if (
-      !allowAnyChars &&
-      !AuthenticationManager._passwordCharactersAreValid(password)
+        !allowAnyChars &&
+        !AuthenticationManager._passwordCharactersAreValid(password)
     ) {
       return new InvalidPasswordError({
         message: 'password contains an invalid character',
         info: { code: 'invalid_character' },
       })
+    }
+    if (typeof email === 'string' && email !== '') {
+      const startOfEmail = email.split('@')[0]
+      if (
+          password.indexOf(email) !== -1 ||
+          password.indexOf(startOfEmail) !== -1
+      ) {
+        return new InvalidPasswordError({
+          message: 'password contains part of email address',
+          info: { code: 'contains_email' },
+        })
       }
-      return null
-    },
+    }
+    return null
+  },
 
   setUserPassword(user, password, callback) {
     AuthenticationManager.setUserPasswordInV2(user, password, callback)
@@ -178,7 +176,6 @@ const AuthenticationManager = {
 
   checkRounds(user, hashedPassword, password, callback) {
     // Temporarily disable this function, TODO: re-enable this
-    //return callback()
     if (Settings.security.disableBcryptRoundsUpgrades) {
       return callback()
     }
@@ -201,11 +198,9 @@ const AuthenticationManager = {
   },
 
   setUserPasswordInV2(user, password, callback) {
-    //if (!user || !user.email || !user._id) {
-    //  return callback(new Error('invalid user object'))
-    //}
-
-    console.log("Setting pass for user: " + JSON.stringify(user))
+    if (!user || !user.email || !user._id) {
+      return callback(new Error('invalid user object'))
+    }
     const validationError = this.validatePassword(password, user.email)
     if (validationError) {
       return callback(validationError)
@@ -215,23 +210,24 @@ const AuthenticationManager = {
         return callback(error)
       }
       db.users.updateOne(
-        {
-          _id: ObjectId(user._id.toString()),
-        },
-        {
-          $set: {
-            hashedPassword: hash,
+          {
+            _id: ObjectId(user._id.toString()),
           },
-          $unset: {
-            password: true,
+          {
+            $set: {
+              hashedPassword: hash,
+            },
+            $unset: {
+              password: true,
+            },
           },
-        },
-        function (updateError, result) {
-          if (updateError) {
-            return callback(updateError)
+          function (updateError, result) {
+            if (updateError) {
+              return callback(updateError)
+            }
+            _checkWriteResult(result, callback)
+            HaveIBeenPwned.checkPasswordForReuseInBackground(password)
           }
-          _checkWriteResult(result, callback)
-        }
       )
     })
   },
@@ -239,8 +235,8 @@ const AuthenticationManager = {
   _passwordCharactersAreValid(password) {
     let digits, letters, lettersUp, symbols
     if (
-      Settings.passwordStrengthOptions &&
-      Settings.passwordStrengthOptions.chars
+        Settings.passwordStrengthOptions &&
+        Settings.passwordStrengthOptions.chars
     ) {
       digits = Settings.passwordStrengthOptions.chars.digits
       letters = Settings.passwordStrengthOptions.chars.letters
@@ -254,10 +250,10 @@ const AuthenticationManager = {
 
     for (let charIndex = 0; charIndex <= password.length - 1; charIndex++) {
       if (
-        digits.indexOf(password[charIndex]) === -1 &&
-        letters.indexOf(password[charIndex]) === -1 &&
-        lettersUp.indexOf(password[charIndex]) === -1 &&
-        symbols.indexOf(password[charIndex]) === -1
+          digits.indexOf(password[charIndex]) === -1 &&
+          letters.indexOf(password[charIndex]) === -1 &&
+          lettersUp.indexOf(password[charIndex]) === -1 &&
+          symbols.indexOf(password[charIndex]) === -1
       ) {
         return false
       }
@@ -276,6 +272,8 @@ const AuthenticationManager = {
 
     var mail = query.email
     var uid = query.email.split('@')[0]
+    var aUid = uid
+    var aMail = mail
     var firstname = ""
     var lastname = ""
     var isAdmin = false
@@ -285,6 +283,7 @@ const AuthenticationManager = {
     const replacerUid = new RegExp("%u", "g")
     const replacerMail = new RegExp("%m","g")
     const filterstr = process.env.LDAP_USER_FILTER.replace(replacerUid, ldapEscape.filter`${uid}`).replace(replacerMail, ldapEscape.filter`${mail}`) //replace all appearances
+    logger.error({}, filterstr);
     // check bind
     try {
       if(process.env.LDAP_BINDDN){ //try to bind directly with the user trying to log in
@@ -295,9 +294,9 @@ const AuthenticationManager = {
       }
     } catch (ex) {
       if(process.env.LDAP_BINDDN){
-        console.log("Could not bind user: " + userDn);
+        logger.error("Could not bind user: " + userDn);
       }else{
-        console.log("Could not bind LDAP reader: " + ldap_reader + " err: " + String(ex))
+        logger.error("Could not bind LDAP reader: " + ldap_reader + " err: " + String(ex))
       }
       return callback(null, null)
     }
@@ -309,7 +308,7 @@ const AuthenticationManager = {
         filter: filterstr ,
       });
       await searchEntries
-      console.log(JSON.stringify(searchEntries))
+      // logger.error(JSON.stringify(searchEntries))
       if (searchEntries[0]) {
         mail = searchEntries[0].mail
         uid = searchEntries[0].uid
@@ -318,10 +317,12 @@ const AuthenticationManager = {
         if(!process.env.LDAP_BINDDN){ //dn is already correctly assembled
           userDn = searchEntries[0].dn
         }
-        console.log("Found user: " + mail + " Name: " + firstname + " " + lastname + " DN: " + userDn)
+        logger.error("Found user: " + mail + " Name: " + firstname + " " + lastname + " DN: " + userDn)
+      } else {
+        logger.error("User not found in DB")
       }
     } catch (ex) {
-      console.log("An Error occured while getting user data during ldapsearch: " + String(ex))
+      logger.error("An Error occured while getting user data during ldapsearch: " + String(ex))
       await client.unbind();
       return callback(null, null)
     }
@@ -330,26 +331,27 @@ const AuthenticationManager = {
       // if admin filter is set - only set admin for user in ldap group
       // does not matter - admin is deactivated: managed through ldap
       if (process.env.LDAP_ADMIN_GROUP_FILTER) {
-        const adminfilter = process.env.LDAP_ADMIN_GROUP_FILTER.replace(replacerUid, ldapEscape.filter`${uid}`).replace(replacerMail, ldapEscape.filter`${mail}`)
+        const adminfilter = process.env.LDAP_ADMIN_GROUP_FILTER.replace(replacerUid, ldapEscape.filter`${aUid}`).replace(replacerMail, ldapEscape.filter`${aMail}`)
         adminEntry = await client.search(ldap_base, {
           scope: 'sub',
           filter: adminfilter,
         });
         await adminEntry;
-        //console.log("Admin Search response:" + JSON.stringify(adminEntry.searchEntries))
+        logger.error({}, adminfilter)
+        // logger.error("Admin Search response:" + JSON.stringify(adminEntry.searchEntries))
         if (adminEntry.searchEntries[0]) {
-          console.log("is Admin")
+          logger.error({}, "is Admin")
           isAdmin=true;
         }
       }
     } catch (ex) {
-      console.log("An Error occured while checking for admin rights - setting admin rights to false: " + String(ex))
+      logger.error({}, "An Error occured while checking for admin rights - setting admin rights to false: " + String(ex))
       isAdmin = false;
     } finally {
       await client.unbind();
     }
     if (mail == "" || userDn == "") {
-      console.log("Mail / userDn not set - exit. This should not happen - please set mail-entry in ldap.")
+      logger.error("Mail / userDn not set - exit. This should not happen - please set mail-entry in ldap.")
       return callback(null, null)
     }
 
@@ -357,21 +359,25 @@ const AuthenticationManager = {
       try {
         await client.bind(userDn, password);
       } catch (ex) {
-        console.log("Could not bind User: " + userDn + " err: " + String(ex))
+        logger.error("Could not bind User: " + userDn + " err: " + String(ex))
         return callback(null, null)
       } finally{
         await client.unbind()
       }
     }
-    //console.log("Logging in user: " + mail + " Name: " + firstname + " " + lastname + " isAdmin: " + String(isAdmin))
+    logger.error({}, "Logging in user: " + mail + " Name: " + firstname + " " + lastname + " isAdmin: " + String(isAdmin))
     // we are authenticated now let's set the query to the correct mail from ldap
     query.email = mail
-    User.findOne(query, (error, user) => {
+    User.findOne(query, async (error, user) => {
       if (error) {
-        console.log(error)
+        logger.error(error)
       }
       if (user && user.hashedPassword) {
-        //console.log("******************** LOGIN ******************")
+        logger.error("******************** LOGIN ******************")
+        if (user.isAdmin !== isAdmin) {
+          user.isAdmin = isAdmin
+          await user.save()
+        }
         AuthenticationManager.login(user, "randomPass", callback)
       } else {
         onSuccessCreateUserIfNotExistent(query, user, callback, uid, firstname, lastname, mail, isAdmin)
