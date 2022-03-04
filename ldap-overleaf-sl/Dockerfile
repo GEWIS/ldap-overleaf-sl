@@ -32,7 +32,7 @@ RUN apt-get -y install python-pygments
 
 # overwrite some files
 COPY sharelatex/AuthenticationManager.js /overleaf/services/web/app/src/Features/Authentication/
-COPY sharelatex/ContactController.js 	/overleaf/services/web/app/src/Features/Contacts/~
+COPY sharelatex/ContactController.js 	/overleaf/services/web/app/src/Features/Contacts/
 COPY sharelatex/login.pug 		/overleaf/services/web/app/views/user/
 
 # Collaboration settings display (share project placeholder) | edit line 146
